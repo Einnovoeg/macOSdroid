@@ -48,6 +48,24 @@ open dist/macOSdroid.app
 
 5. Import APKs with the `Import APKs` button, drag them onto the inbox card, or drop them into `~/Applications/macOSdroid Inbox`.
 
+## Releases
+
+- Repository: [github.com/Einnovoeg/macOSdroid](https://github.com/Einnovoeg/macOSdroid)
+- Release version source: [`VERSION`](VERSION)
+- Version history: [`CHANGELOG.md`](CHANGELOG.md)
+- To build a versioned release archive locally:
+
+```bash
+chmod +x scripts/release.sh
+./scripts/release.sh
+```
+
+That command produces:
+
+- `dist/macOSdroid.app`
+- `dist/macOSdroid-<version>-macos.zip`
+- `dist/macOSdroid-<version>-macos.zip.sha256`
+
 ## Installation Details
 
 ### Bootstrap Script
@@ -75,7 +93,9 @@ The default settings written by the script are:
 
 - Source code: [`Sources/macOSdroid`](Sources/macOSdroid)
 - Packaging script: [`scripts/package-app.sh`](scripts/package-app.sh)
+- Release script: [`scripts/release.sh`](scripts/release.sh)
 - Runtime bootstrap script: [`scripts/provision-runtime.sh`](scripts/provision-runtime.sh)
+- Release version: [`VERSION`](VERSION)
 - Dependency list: [`DEPENDENCIES.md`](DEPENDENCIES.md)
 - Third-party notices: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 - License: [`LICENSE`](LICENSE)
