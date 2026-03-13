@@ -1,0 +1,31 @@
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Packaged output and local test assets
+dist/
+tmp/
+
+# Editor and shell noise
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local secrets and machine-specific files
+.env
+.env.*
+.netrc
