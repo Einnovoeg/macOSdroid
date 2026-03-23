@@ -1,6 +1,6 @@
 import Foundation
 
-/// High-level lifecycle state for the hidden Android runtime.
+/// High-level lifecycle state for the managed Android runtime.
 enum RuntimeState: String {
     case stopped
     case starting
@@ -24,11 +24,29 @@ enum RuntimeState: String {
     }
 }
 
-/// Lightweight activity item shown in the dashboard log pane.
+/// Lightweight activity item shown in the dashboard summary and dedicated log window.
 struct LogEntry: Identifiable {
     let id = UUID()
     let timestamp: Date
     let message: String
+}
+
+/// Compact view model for an ADB-visible device that can be mirrored through scrcpy.
+struct ADBDevice: Identifiable, Equatable {
+    enum Kind: Equatable {
+        case emulator
+        case physical
+    }
+
+    let id: String
+    let serial: String
+    let name: String
+    let kind: Kind
+    let state: String
+
+    var title: String {
+        name.isEmpty ? serial : name
+    }
 }
 
 /// File-based fingerprint used to decide whether an APK should be reinstalled.
@@ -99,6 +117,9 @@ enum RuntimeError: LocalizedError {
     case installFailed(String)
     case launchFailed(String)
     case uninstallFailed(String)
+    case invalidPackageName(String)
+    case runtimeProvisioningUnavailable
+    case runtimeProvisioningFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -120,6 +141,12 @@ enum RuntimeError: LocalizedError {
             "App launch failed: \(message)"
         case .uninstallFailed(let message):
             "App uninstall failed: \(message)"
+        case .invalidPackageName(let value):
+            "Rejected an invalid Android package identifier: \(value)"
+        case .runtimeProvisioningUnavailable:
+            "Runtime setup is unavailable because the bundled provisioner script could not be found."
+        case .runtimeProvisioningFailed(let message):
+            "Managed runtime setup failed: \(message)"
         }
     }
 }

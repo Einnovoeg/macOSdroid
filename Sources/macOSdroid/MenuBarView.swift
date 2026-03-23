@@ -41,39 +41,70 @@ struct MenuBarView: View {
                 openWindow(id: "dashboard")
                 NSApp.activate(ignoringOtherApps: true)
             }
+            .help("Show the main macOSdroid dashboard window.")
+
+            Button("Open Activity Log") {
+                openWindow(id: "activity-log")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            .help("Show the separate diagnostics window.")
+
+            Button(model.isProvisioningRuntime ? "Preparing Runtime" : "Prepare Runtime") {
+                model.provisionManagedRuntime()
+            }
+            .disabled(model.isProvisioningRuntime || !(model.runtimeState == .stopped || model.runtimeState == .failed))
+            .help("Install or refresh the managed Android runtime inside Application Support.")
 
             Button(model.canStart ? "Start Runtime" : "Runtime Starting") {
                 model.startRuntime()
             }
             .disabled(!model.canStart)
+            .help("Boot the managed Android runtime in the background.")
 
             Button(model.canStop ? "Stop Runtime" : "Runtime Stopped") {
                 model.stopRuntime()
             }
             .disabled(!model.canStop)
+            .help("Shut down the managed Android runtime.")
 
             Button("Import APKs") {
                 model.importAPKFiles()
             }
+            .help("Copy APK files into the managed inbox.")
 
             Button("Open Watch Folder") {
                 model.revealWatchFolder()
             }
+            .help("Reveal the inbox folder in Finder.")
+
+            Button("Show Android Window") {
+                model.revealAndroidWindow()
+            }
+            .disabled(!model.runtimeReady || !model.settings.showAndroidWindow)
+            .help("Bring the full Android runtime window to the front.")
 
             Button("Rescan Library") {
                 model.refreshLibrary()
             }
+            .help("Reload the inbox catalog and APK metadata.")
+
+            Divider()
+
+            Button("Open Launchers Folder") {
+                model.revealLauncherFolder()
+            }
+            .help("Reveal the Finder launchers folder.")
+
+            Button("Open Support Folder") {
+                model.revealApplicationSupportFolder()
+            }
+            .help("Reveal the managed Application Support folder.")
 
             Button("Hide Dashboard") {
                 model.hideDashboard()
             }
             .disabled(!model.settings.menuBarOnly)
-
-            Divider()
-
-            Link(destination: ProjectLinks.support) {
-                Label("Buy Me a Coffee", systemImage: "cup.and.saucer.fill")
-            }
+            .help("Hide the dashboard while keeping the menu bar utility running.")
         }
         .padding(14)
         .frame(width: 300)

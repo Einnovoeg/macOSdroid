@@ -17,6 +17,9 @@ struct AndroidToolchain: Sendable {
         var values = [
             "ANDROID_HOME": sdkRoot.path,
             "ANDROID_SDK_ROOT": sdkRoot.path,
+            "ANDROID_USER_HOME": AppSettings.managedAndroidUserHome.path,
+            "ANDROID_EMULATOR_HOME": AppSettings.managedAndroidUserHome.path,
+            "ANDROID_AVD_HOME": AppSettings.managedAVDDirectory.path,
         ]
 
         if let javaHome {
@@ -72,6 +75,7 @@ struct AndroidToolchain: Sendable {
             roots.append(URL(fileURLWithPath: NSString(string: androidHome).expandingTildeInPath))
         }
 
+        roots.append(AppSettings.defaultManagedSDKRoot)
         roots.append(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Android/sdk"))
         roots.append(URL(fileURLWithPath: "/opt/homebrew/share/android-commandlinetools"))
         roots.append(URL(fileURLWithPath: "/opt/android-sdk"))

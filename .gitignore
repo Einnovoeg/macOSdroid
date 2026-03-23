@@ -17,6 +17,9 @@ xcuserdata/
 # Packaged output and local test assets
 dist/
 tmp/
+.codex-home/
+.codex-cache/
+.build-sandbox/
 
 # Editor and shell noise
 *.swp

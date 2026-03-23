@@ -1,6 +1,6 @@
 # macOSdroid
 
-`macOSdroid` is a native SwiftUI macOS host for Android applications. It keeps the Android Emulator hidden in the background, watches an inbox folder for `.apk` files, installs them with `adb`, and can launch those apps from the dashboard, the menu bar, or Finder launchers.
+`macOSdroid` is a native SwiftUI macOS host for Android applications. It keeps its managed runtime state under `~/Library/Application Support/macOSdroid`, watches an inbox folder for `.apk` files, installs them with `adb`, and can surface Android apps in dedicated `scrcpy` windows when `scrcpy` is available.
 
 ## What It Does
 
@@ -9,7 +9,8 @@
 - Watches a configurable folder for `.apk` files and imports APKs directly from the UI.
 - Installs changed APKs automatically with `adb install -r`.
 - Tracks whether watched APKs are installed in the active Android runtime.
-- Launches installed apps automatically when package metadata can be resolved.
+- Opens Android apps inside dedicated `scrcpy` windows when available, with fallback to the emulator window when requested.
+- Mirrors attached Android phones over ADB through the same `scrcpy` integration used for emulator-backed app windows.
 - Exports Finder launchers as `.webloc` files backed by the `macosdroid://` URL scheme.
 - Supports launch-at-login when running from the packaged `.app`.
 
@@ -19,13 +20,14 @@
 - Xcode 16 or newer, or a Swift 6.2 toolchain
 - Android SDK components listed in [DEPENDENCIES.md](DEPENDENCIES.md)
 - A JDK 17+ installation for Android command-line tools
+- `scrcpy` for separate app windows and attached Android phone viewing
 
 The repository does not vendor the Android SDK, emulator, platform tools, or a JDK. Those must be installed separately by the user.
 
 ## Quick Start
 
 1. Install the required host dependencies listed in [DEPENDENCIES.md](DEPENDENCIES.md).
-2. Bootstrap the Android runtime:
+2. Bootstrap the Android runtime from the repository:
 
 ```bash
 chmod +x scripts/provision-runtime.sh
@@ -46,11 +48,19 @@ chmod +x scripts/package-app.sh
 open dist/macOSdroid.app
 ```
 
-5. Import APKs with the `Import APKs` button, drag them onto the inbox card, or drop them into `~/Applications/macOSdroid Inbox`.
+5. Or package a drag-to-Applications disk image:
+
+```bash
+chmod +x scripts/package-dmg.sh
+./scripts/package-dmg.sh
+open dist/macOSdroid-$(<VERSION).dmg
+```
+
+6. If you install the packaged `.app` or `.dmg`, open the app and click `Prepare Managed Runtime` in the `Runtime` tab. That runs the bundled setup script and installs the managed SDK, AVD, and `scrcpy` support into `~/Library/Application Support/macOSdroid`.
+7. Import APKs with the `Import APKs` button, drag them onto the inbox card, or drop them into `~/Library/Application Support/macOSdroid/Inbox`.
 
 ## Releases
 
-- Repository: [github.com/Einnovoeg/macOSdroid](https://github.com/Einnovoeg/macOSdroid)
 - Release version source: [`VERSION`](VERSION)
 - Version history: [`CHANGELOG.md`](CHANGELOG.md)
 - To build a versioned release archive locally:
@@ -65,6 +75,18 @@ That command produces:
 - `dist/macOSdroid.app`
 - `dist/macOSdroid-<version>-macos.zip`
 - `dist/macOSdroid-<version>-macos.zip.sha256`
+- `dist/macOSdroid-<version>.dmg`
+- `dist/macOSdroid-<version>.dmg.sha256`
+- `dist/macOSdroid-<version>-release-notes.md`
+
+To build the drag-to-Applications disk image used for standalone distribution:
+
+```bash
+chmod +x scripts/package-dmg.sh
+./scripts/package-dmg.sh
+```
+
+Before publishing a release, update `VERSION`, add the matching section to `CHANGELOG.md`, run `./scripts/release.sh`, then tag the commit as `v<version>` in your Git host of choice.
 
 ## Installation Details
 
@@ -74,6 +96,7 @@ That command produces:
 
 - installs Homebrew-managed Android command-line tools if they are missing
 - installs `openjdk@17` if it is missing
+- installs `scrcpy` if it is missing
 - provisions Android SDK packages required by the app
 - creates an Android Virtual Device
 - writes the app defaults domain so the packaged app starts with a working configuration
@@ -81,18 +104,21 @@ That command produces:
 The default settings written by the script are:
 
 - defaults domain: `io.macosdroid.app`
-- SDK root: `~/Library/Android/sdk`
-- watch folder: `~/Applications/macOSdroid Inbox`
+- app support root: `~/Library/Application Support/macOSdroid`
+- SDK root: `~/Library/Application Support/macOSdroid/Runtime/android-sdk`
+- Android user home: `~/Library/Application Support/macOSdroid/AndroidUserHome`
+- watch folder: `~/Library/Application Support/macOSdroid/Inbox`
 - AVD name: `macOSdroid-API35`
 
 ### Packaged App
 
-[`scripts/package-app.sh`](scripts/package-app.sh) builds a release binary, creates `dist/macOSdroid.app`, writes a minimal `Info.plist`, and ad-hoc signs the bundle so it can be opened from Finder.
+[`scripts/package-app.sh`](scripts/package-app.sh) builds a release binary, creates `dist/macOSdroid.app`, copies repository documentation and license notices into `Contents/Resources/Documentation`, bundles `scripts/provision-runtime.sh` into `Contents/Resources/scripts`, writes a minimal `Info.plist`, and ad-hoc signs the bundle so it can be opened from Finder.
 
 ## Project Files
 
 - Source code: [`Sources/macOSdroid`](Sources/macOSdroid)
 - Packaging script: [`scripts/package-app.sh`](scripts/package-app.sh)
+- DMG packaging script: [`scripts/package-dmg.sh`](scripts/package-dmg.sh)
 - Release script: [`scripts/release.sh`](scripts/release.sh)
 - Runtime bootstrap script: [`scripts/provision-runtime.sh`](scripts/provision-runtime.sh)
 - Release version: [`VERSION`](VERSION)
@@ -108,4 +134,4 @@ The project itself is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## Support
 
-Support the project at [buymeacoffee.com/einnovoeg](https://buymeacoffee.com/einnovoeg).
+- Buy Me a Coffee: [buymeacoffee.com/einnovoeg](https://buymeacoffee.com/einnovoeg)

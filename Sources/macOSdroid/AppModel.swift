@@ -4,7 +4,7 @@ import Foundation
 import ServiceManagement
 import UniformTypeIdentifiers
 
-/// Coordinates the macOS host UI with the Android SDK toolchain, hidden emulator lifecycle,
+/// Coordinates the macOS host UI with the Android SDK toolchain, managed emulator lifecycle,
 /// watched folder, and Finder launcher flow.
 @MainActor
 final class AppModel: ObservableObject {
@@ -14,8 +14,10 @@ final class AppModel: ObservableObject {
     @Published var statusMessage = "Waiting for configuration"
     @Published var logs: [LogEntry] = []
     @Published var connectedDevice: String?
+    @Published var attachedDevices: [ADBDevice] = []
     @Published var folderApps: [FolderApp] = []
     @Published var launchAtLoginStatus = "Not configured"
+    @Published var isProvisioningRuntime = false
 
     private var emulatorProcess: Process?
     private var folderMonitor: FolderMonitor?
@@ -28,9 +30,12 @@ final class AppModel: ObservableObject {
     private var startTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
     private var deviceMonitorTask: Task<Void, Never>?
+    private var provisionTask: Task<Void, Never>?
     private var pendingLaunchRequest: LaunchRequest?
 
     init() {
+        migrateManagedFoldersIfNeeded()
+        ensureManagedSupportFoldersExist()
         ensureWatchFolderExists()
         ensureLauncherFolderExists()
 
@@ -54,11 +59,11 @@ final class AppModel: ObservableObject {
     }
 
     var watchFolderURL: URL {
-        URL(fileURLWithPath: NSString(string: settings.watchFolderPath).expandingTildeInPath)
+        URL(fileURLWithPath: NSString(string: settings.watchFolderPath).expandingTildeInPath).standardizedFileURL
     }
 
     var launcherFolderURL: URL {
-        AppSettings.defaultLauncherFolder
+        AppSettings.defaultLauncherFolder.standardizedFileURL
     }
 
     var installedFolderAppCount: Int {
@@ -68,7 +73,7 @@ final class AppModel: ObservableObject {
     // MARK: - User actions
 
     func updateSDKPath(_ path: String) {
-        settings.sdkRootPath = path
+        settings.sdkRootPath = normalizedFilesystemPath(path)
         saveSettings()
     }
 
@@ -78,9 +83,22 @@ final class AppModel: ObservableObject {
     }
 
     func updateWatchFolderPath(_ path: String) {
-        settings.watchFolderPath = path
-        ensureWatchFolderExists()
+        settings.watchFolderPath = normalizedFilesystemPath(path)
         saveSettings()
+    }
+
+    /// Keep watch-folder text edits cheap and reversible. Directory creation, folder monitoring,
+    /// and optional rescans are triggered only when the caller explicitly applies the new path.
+    func applyWatchFolderSettings(rescanReason: String? = nil) {
+        ensureWatchFolderExists()
+        restartFolderMonitor()
+
+        Task {
+            await refreshFolderCatalog()
+            if let rescanReason, runtimeState == .running {
+                scheduleFolderScan(reason: rescanReason)
+            }
+        }
     }
 
     func toggleAutoLaunch(_ enabled: Bool) {
@@ -105,6 +123,97 @@ final class AppModel: ObservableObject {
 
         Task {
             await syncLaunchAtLogin()
+        }
+    }
+
+    func toggleShowAndroidWindow(_ enabled: Bool) {
+        settings.showAndroidWindow = enabled
+        saveSettings()
+
+        guard runtimeState == .running || runtimeState == .starting else {
+            return
+        }
+
+        let mode = enabled ? "visible" : "hidden"
+        statusMessage = "Restart the runtime to apply the \(mode) Android window mode"
+        appendLog("Android window mode changed to \(mode); restart the runtime to apply it")
+    }
+
+    func togglePreferSeparateAppWindows(_ enabled: Bool) {
+        settings.preferSeparateAppWindows = enabled
+        saveSettings()
+
+        statusMessage = enabled
+            ? "Android apps will open in their own windows when scrcpy is available"
+            : "Android apps will launch directly inside the runtime display"
+    }
+
+    func revealAndroidWindow() {
+        guard runtimeState == .running else {
+            statusMessage = "Start the runtime before opening the Android window"
+            appendLog("Android window request skipped because the runtime is not running")
+            return
+        }
+
+        guard settings.showAndroidWindow else {
+            statusMessage = "Enable Show Android Window and restart the runtime to surface launched apps"
+            appendLog("Android window request skipped because the runtime is configured to stay hidden")
+            return
+        }
+
+        guard focusAndroidWindow() else {
+            statusMessage = "Unable to bring the Android window to the front"
+            appendLog("Android window activation failed")
+            return
+        }
+
+        statusMessage = "Android window ready"
+        appendLog("Brought the Android window to the front")
+    }
+
+    func clearLogs() {
+        logs.removeAll()
+        try? Data().write(to: AppSettings.activityLogFile, options: .atomic)
+        statusMessage = "Activity log cleared"
+    }
+
+    func revealActivityLogFile() {
+        ensureManagedSupportFoldersExist()
+        if !FileManager.default.fileExists(atPath: AppSettings.activityLogFile.path) {
+            FileManager.default.createFile(atPath: AppSettings.activityLogFile.path, contents: nil)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([AppSettings.activityLogFile])
+    }
+
+    func revealApplicationSupportFolder() {
+        ensureManagedSupportFoldersExist()
+        NSWorkspace.shared.open(AppSettings.applicationSupportDirectory)
+    }
+
+    func provisionManagedRuntime() {
+        guard !isProvisioningRuntime else {
+            return
+        }
+
+        provisionTask?.cancel()
+        provisionTask = Task {
+            await performProvisionManagedRuntime()
+        }
+    }
+
+    func refreshAttachedDevices() {
+        Task {
+            await refreshADBDevices()
+        }
+    }
+
+    func openAttachedDevice(_ device: ADBDevice) {
+        do {
+            try launchScrcpyWindow(for: device)
+            statusMessage = "Opened \(device.title) in a device window"
+        } catch {
+            statusMessage = error.localizedDescription
+            appendLog("Device view failed for \(device.title): \(error.localizedDescription)")
         }
     }
 
@@ -134,10 +243,7 @@ final class AppModel: ObservableObject {
 
         if panel.runModal() == .OK, let url = panel.url {
             updateWatchFolderPath(url.path)
-            restartFolderMonitor()
-            Task {
-                await refreshFolderCatalog()
-            }
+            applyWatchFolderSettings()
         }
     }
 
@@ -162,6 +268,7 @@ final class AppModel: ObservableObject {
     }
 
     func revealWatchFolder() {
+        applyWatchFolderSettings()
         NSWorkspace.shared.open(watchFolderURL)
     }
 
@@ -175,10 +282,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshLibrary() {
-        Task {
-            await refreshFolderCatalog()
-            scheduleFolderScan(reason: "Manual rescan")
-        }
+        applyWatchFolderSettings(rescanReason: "Manual rescan")
     }
 
     func installFolderApp(_ app: FolderApp) {
@@ -230,7 +334,8 @@ final class AppModel: ObservableObject {
             let output = try await Shell.run(
                 executable: toolchain.emulator.path,
                 arguments: ["-list-avds"],
-                environment: toolchain.environment
+                environment: toolchain.environment,
+                timeout: 20
             )
 
             let avds = output.stdout
@@ -247,7 +352,7 @@ final class AppModel: ObservableObject {
             if runtimeState == .stopped || runtimeState == .failed {
                 statusMessage = avds.isEmpty
                     ? "Create an Android Virtual Device in Android Studio or with avdmanager"
-                    : "Ready to start a headless Android runtime"
+                    : "Ready to start the Android runtime"
             }
         } catch {
             availableAVDs = []
@@ -294,6 +399,7 @@ final class AppModel: ObservableObject {
         }
         restartFolderMonitor()
         await refreshAVDs()
+        await refreshADBDevices()
         await refreshFolderCatalog()
 
         if settings.autoStartRuntime {
@@ -301,8 +407,72 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Launches a fresh headless emulator, waits for Android services to come online, then starts
-    /// folder scanning and periodic health checks.
+    /// Runs the packaged bootstrap script so drag-installed builds can provision their managed
+    /// runtime without requiring the user to clone the repository first.
+    private func performProvisionManagedRuntime() async {
+        guard runtimeState == .stopped || runtimeState == .failed else {
+            statusMessage = "Stop the runtime before running managed setup"
+            appendLog("Managed runtime setup skipped because the runtime is active")
+            return
+        }
+
+        guard let scriptURL = runtimeProvisionerScriptURL() else {
+            statusMessage = RuntimeError.runtimeProvisioningUnavailable.localizedDescription
+            appendLog(statusMessage)
+            return
+        }
+
+        isProvisioningRuntime = true
+        statusMessage = "Preparing the managed Android runtime"
+        appendLog("Starting managed runtime setup")
+
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? AppSettings.defaultBundleIdentifier
+
+        do {
+            let exitStatus = try await runLoggedProcess(
+                executable: "/bin/zsh",
+                arguments: [scriptURL.path],
+                environment: ["MACOSDROID_APP_DOMAIN": bundleIdentifier],
+                logFile: AppSettings.runtimeSetupLogFile
+            )
+
+            guard exitStatus == 0 else {
+                throw RuntimeError.runtimeProvisioningFailed(
+                    "See \(AppSettings.runtimeSetupLogFile.lastPathComponent) for details."
+                )
+            }
+
+            settings = AppSettings.load()
+            ensureManagedSupportFoldersExist()
+            ensureWatchFolderExists()
+            ensureLauncherFolderExists()
+            restartFolderMonitor()
+            await refreshAVDs()
+            await refreshADBDevices()
+            await refreshFolderCatalog()
+
+            appendLog("Managed runtime setup completed")
+            appendLog("Detailed setup log written to \(AppSettings.runtimeSetupLogFile.path)")
+
+            statusMessage = availableAVDs.isEmpty
+                ? "Runtime setup completed. Create or detect an AVD, then start the runtime."
+                : "Managed runtime ready"
+
+            if settings.autoStartRuntime, canStart {
+                startRuntime()
+            }
+        } catch {
+            let errorDescription = error.localizedDescription
+            statusMessage = errorDescription
+            appendLog("Managed runtime setup failed: \(errorDescription)")
+            appendLog("Detailed setup log written to \(AppSettings.runtimeSetupLogFile.path)")
+        }
+
+        isProvisioningRuntime = false
+    }
+
+    /// Launches a managed emulator, waits for Android services to come online, then starts folder
+    /// scanning and periodic health checks.
     private func performStart() async {
         deviceMonitorTask?.cancel()
         deviceMonitorTask = nil
@@ -318,39 +488,48 @@ final class AppModel: ObservableObject {
                 throw RuntimeError.avdMissing
             }
 
+            ensureManagedSupportFoldersExist()
             ensureWatchFolderExists()
 
             let existingDevices = try await connectedDeviceSerials(using: toolchain)
+            var emulatorArguments = [
+                "-avd", settings.avdName,
+                "-no-audio",
+                "-no-boot-anim",
+                "-no-snapshot-save",
+                "-gpu", "swiftshader_indirect",
+                "-netdelay", "none",
+                "-netspeed", "full",
+            ]
+
+            if !settings.showAndroidWindow {
+                emulatorArguments.insert("-no-window", at: 2)
+            }
+
             let emulator = try Shell.spawn(
                 executable: toolchain.emulator.path,
-                arguments: [
-                    "-avd", settings.avdName,
-                    "-no-window",
-                    "-no-audio",
-                    "-no-boot-anim",
-                    "-no-snapshot-save",
-                    "-gpu", "swiftshader_indirect",
-                    "-netdelay", "none",
-                    "-netspeed", "full",
-                ],
+                arguments: emulatorArguments,
                 environment: toolchain.environment
             )
 
             emulatorProcess = emulator
             appendLog("Emulator process launched for AVD \(settings.avdName)")
 
+            appendLog("Waiting for an emulator device to appear in adb")
             let serial = try await waitForFreshDevice(using: toolchain, excluding: existingDevices)
             connectedDevice = serial
             appendLog("Device connected as \(serial)")
 
+            appendLog("Waiting for Android boot completion on \(serial)")
             try await waitForBoot(using: toolchain, serial: serial)
             appendLog("Android runtime boot completed")
 
             restartFolderMonitor()
             knownAPKs.removeAll()
             runtimeState = .running
-            statusMessage = "Watching \(watchFolderURL.lastPathComponent) for APKs"
+            statusMessage = launchReadyMessage()
             try await refreshInstalledPackages(using: toolchain, serial: serial)
+            await refreshADBDevices(using: toolchain)
             startDeviceMonitor(using: toolchain, serial: serial)
             await fulfillPendingLaunchIfNeeded(using: toolchain, serial: serial)
 
@@ -392,6 +571,7 @@ final class AppModel: ObservableObject {
         connectedDevice = nil
         installedPackages.removeAll()
         knownAPKs.removeAll()
+        await refreshADBDevices(using: runtimeToolchain ?? AndroidToolchain.resolve(preferredPath: settings.sdkRootPath))
         await refreshFolderCatalog()
 
         if cleanStatus {
@@ -413,12 +593,29 @@ final class AppModel: ObservableObject {
         return toolchain
     }
 
+    private func launchReadyMessage() -> String {
+        if settings.preferSeparateAppWindows, scrcpyExecutableURL() != nil {
+            return "Watching \(watchFolderURL.lastPathComponent) and ready to open apps in their own windows"
+        }
+
+        if settings.preferSeparateAppWindows, !settings.showAndroidWindow {
+            return "Watching \(watchFolderURL.lastPathComponent); install scrcpy or enable the Android window to surface apps"
+        }
+
+        if settings.showAndroidWindow {
+            return "Watching \(watchFolderURL.lastPathComponent) and ready to open apps"
+        }
+
+        return "Watching \(watchFolderURL.lastPathComponent) in a hidden Android runtime"
+    }
+
     /// The app only manages emulator devices, so physical phones are filtered out here.
     private func connectedDeviceSerials(using toolchain: AndroidToolchain) async throws -> Set<String> {
         let output = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["devices"],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 10
         )
 
         let serials = output.stdout
@@ -434,6 +631,85 @@ final class AppModel: ObservableObject {
             }
 
         return Set(serials)
+    }
+
+    /// Discover both emulator and physical devices so the UI can offer runtime and phone views
+    /// through the same ADB-backed pipeline.
+    private func refreshADBDevices(using toolchain: AndroidToolchain? = nil) async {
+        let resolvedToolchain = toolchain ?? runtimeToolchain ?? AndroidToolchain.resolve(preferredPath: settings.sdkRootPath)
+        guard let resolvedToolchain else {
+            attachedDevices = []
+            return
+        }
+
+        do {
+            attachedDevices = try await adbDevices(using: resolvedToolchain)
+        } catch {
+            appendLog("ADB device refresh failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func adbDevices(using toolchain: AndroidToolchain) async throws -> [ADBDevice] {
+        let output = try await Shell.run(
+            executable: toolchain.adb.path,
+            arguments: ["devices", "-l"],
+            environment: toolchain.environment,
+            timeout: 10
+        )
+
+        guard output.status == 0 else {
+            return []
+        }
+
+        return output.stdout
+            .split(whereSeparator: \.isNewline)
+            .dropFirst()
+            .compactMap { line in
+                let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    return nil
+                }
+
+                let fields = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard fields.count >= 2 else {
+                    return nil
+                }
+
+                let serial = fields[0]
+                let state = fields[1]
+                guard state == "device" else {
+                    return nil
+                }
+
+                let metadata = Dictionary(uniqueKeysWithValues: fields.dropFirst(2).compactMap { item -> (String, String)? in
+                    guard let separator = item.firstIndex(of: ":") else {
+                        return nil
+                    }
+
+                    let key = String(item[..<separator])
+                    let value = String(item[item.index(after: separator)...])
+                    return (key, value)
+                })
+
+                let isEmulator = serial.hasPrefix("emulator-")
+                let displayName = metadata["model"]?.replacingOccurrences(of: "_", with: " ")
+                    ?? metadata["device"]?.replacingOccurrences(of: "_", with: " ")
+                    ?? serial
+
+                return ADBDevice(
+                    id: serial,
+                    serial: serial,
+                    name: displayName,
+                    kind: isEmulator ? .emulator : .physical,
+                    state: state
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.kind != rhs.kind {
+                    return lhs.kind == .physical
+                }
+                return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+            }
     }
 
     private func waitForFreshDevice(
@@ -474,17 +750,15 @@ final class AppModel: ObservableObject {
         let bootCompleted = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["-s", serial, "shell", "getprop", "sys.boot_completed"],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 10
         )
-
-        if bootCompleted.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
-            return true
-        }
 
         let bootAnimation = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["-s", serial, "shell", "getprop", "init.svc.bootanim"],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 10
         )
 
         guard bootAnimation.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "stopped" else {
@@ -494,8 +768,18 @@ final class AppModel: ObservableObject {
         let packageManager = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["-s", serial, "shell", "pm", "list", "packages"],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 20
         )
+
+        let bootCompletedValue = bootCompleted.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if bootCompletedValue == "1" {
+            return packageManager.status == 0
+        }
+
+        guard bootAnimation.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "stopped" else {
+            return false
+        }
 
         return packageManager.status == 0
     }
@@ -641,6 +925,7 @@ final class AppModel: ObservableObject {
             }
 
             try await refreshInstalledPackages(using: toolchain, serial: serial)
+            await refreshADBDevices(using: toolchain)
             if hasPendingFolderChanges() {
                 scheduleFolderScan(reason: "Background rescan")
             }
@@ -664,6 +949,7 @@ final class AppModel: ObservableObject {
         runtimeState = .failed
         statusMessage = message
         appendLog(message)
+        await refreshADBDevices(using: runtimeToolchain ?? AndroidToolchain.resolve(preferredPath: settings.sdkRootPath))
         await refreshFolderCatalog()
     }
 
@@ -749,17 +1035,39 @@ final class AppModel: ObservableObject {
     ) async throws {
         appendLog("Installing \(apkURL.lastPathComponent)")
 
-        let output = try await Shell.run(
-            executable: toolchain.adb.path,
-            arguments: ["-s", serial, "install", "-r", apkURL.path],
-            environment: toolchain.environment
-        )
+        let maxAttempts = 2
+        var finalOutput: ShellOutput?
 
-        guard output.status == 0, output.stdout.localizedCaseInsensitiveContains("success") else {
+        for attempt in 1...maxAttempts {
+            let output = try await Shell.run(
+                executable: toolchain.adb.path,
+                arguments: ["-s", serial, "install", "-r", apkURL.path],
+                environment: toolchain.environment,
+                timeout: 180
+            )
+            finalOutput = output
+
+            if output.status == 0, output.stdout.localizedCaseInsensitiveContains("success") {
+                break
+            }
+
             let message = [output.stderr, output.stdout]
                 .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 .joined(separator: "\n")
+
+            if attempt < maxAttempts, isTransientBootInstallFailure(message) {
+                appendLog("Android is still finishing startup; retrying \(apkURL.lastPathComponent) install")
+                try await Task.sleep(for: .seconds(12))
+                continue
+            }
+
             throw RuntimeError.installFailed(message.isEmpty ? "Unknown adb install error" : message)
+        }
+
+        guard let output = finalOutput,
+              output.status == 0,
+              output.stdout.localizedCaseInsensitiveContains("success") else {
+            throw RuntimeError.installFailed("Unknown adb install error")
         }
 
         appendLog("Installed \(apkURL.lastPathComponent)")
@@ -773,7 +1081,18 @@ final class AppModel: ObservableObject {
             return
         }
 
-        try await launchPackageAfterInstall(named: packageName, using: toolchain, serial: serial)
+        try await launchPackageAfterInstall(
+            named: packageName,
+            displayName: apkURL.deletingPathExtension().lastPathComponent,
+            using: toolchain,
+            serial: serial
+        )
+    }
+
+    private func isTransientBootInstallFailure(_ message: String) -> Bool {
+        let normalized = message.localizedLowercase
+        return normalized.contains("settings' before system providers are installed")
+            || normalized.contains("before system providers are installed")
     }
 
     /// Package-name inference prefers `apkanalyzer`, but `aapt` remains a reliable fallback when
@@ -783,7 +1102,8 @@ final class AppModel: ObservableObject {
             let output = try? await Shell.run(
                 executable: apkanalyzer.path,
                 arguments: ["manifest", "application-id", apkURL.path],
-                environment: toolchain.environment
+                environment: toolchain.environment,
+                timeout: 20
             )
 
             let packageName = output?.stdout.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -796,7 +1116,8 @@ final class AppModel: ObservableObject {
             let output = try await Shell.run(
                 executable: aapt.path,
                 arguments: ["dump", "badging", apkURL.path],
-                environment: toolchain.environment
+                environment: toolchain.environment,
+                timeout: 20
             )
 
             if let line = output.stdout.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("package:") }),
@@ -915,7 +1236,13 @@ final class AppModel: ObservableObject {
                 return
             }
 
-            try await launchPackage(named: packageName, using: toolchain, serial: serial)
+            try await launchPackage(
+                named: packageName,
+                displayName: app.displayName,
+                using: toolchain,
+                serial: serial
+            )
+            statusMessage = statusMessageForLaunch(of: app.displayName, packageName: packageName)
         } catch {
             statusMessage = error.localizedDescription
             appendLog("Manual launch failed for \(app.fileName): \(error.localizedDescription)")
@@ -987,9 +1314,39 @@ final class AppModel: ObservableObject {
         appendLog("Exported \(createdCount) launcher(s) to \(launcherFolderURL.lastPathComponent)")
     }
 
-    /// Launches the best known launcher activity for a package, falling back to `monkey` only when
-    /// Android cannot resolve a concrete launcher component yet.
-    private func launchPackage(named packageName: String, using toolchain: AndroidToolchain, serial: String) async throws {
+    /// Opens a package in a dedicated scrcpy window when available, otherwise falls back to the
+    /// Android runtime display managed by the emulator itself.
+    private func launchPackage(
+        named packageName: String,
+        displayName: String? = nil,
+        using toolchain: AndroidToolchain,
+        serial: String
+    ) async throws {
+        let launchTitle = displayName ?? packageName
+        let prefersSeparateWindow = settings.preferSeparateAppWindows
+        var openedSeparateWindow = false
+
+        if settings.preferSeparateAppWindows {
+            do {
+                try launchScrcpyWindow(
+                    for: ADBDevice(
+                        id: serial,
+                        serial: serial,
+                        name: launchTitle,
+                        kind: .emulator,
+                        state: "device"
+                    )
+                )
+                openedSeparateWindow = true
+            } catch {
+                if settings.showAndroidWindow {
+                    appendLog("Separate app window fallback for \(launchTitle): \(error.localizedDescription)")
+                } else {
+                    throw error
+                }
+            }
+        }
+
         if let componentName = try await launchComponent(for: packageName, using: toolchain, serial: serial) {
             let launch = try await Shell.run(
                 executable: toolchain.adb.path,
@@ -1000,7 +1357,8 @@ final class AppModel: ObservableObject {
                     "start",
                     "-n", componentName,
                 ],
-                environment: toolchain.environment
+                environment: toolchain.environment,
+                timeout: 30
             )
 
             guard launch.status == 0 else {
@@ -1008,6 +1366,18 @@ final class AppModel: ObservableObject {
                     .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                     .joined(separator: "\n")
                 throw RuntimeError.launchFailed(message.isEmpty ? componentName : message)
+            }
+
+            if settings.showAndroidWindow && !openedSeparateWindow {
+                if focusAndroidWindow() {
+                    appendLog("Brought the Android window to the front")
+                } else {
+                    appendLog("Launched \(componentName) but could not activate the Android window automatically")
+                }
+            }
+
+            if prefersSeparateWindow && openedSeparateWindow {
+                appendLog("Opened \(launchTitle) in its own window")
             }
 
             appendLog("Launched \(componentName)")
@@ -1024,7 +1394,8 @@ final class AppModel: ObservableObject {
                 "-c", "android.intent.category.LAUNCHER",
                 "1",
             ],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 30
         )
 
         guard fallback.status == 0 else {
@@ -1034,6 +1405,18 @@ final class AppModel: ObservableObject {
             throw RuntimeError.launchFailed(message.isEmpty ? packageName : message)
         }
 
+        if settings.showAndroidWindow && !openedSeparateWindow {
+            if focusAndroidWindow() {
+                appendLog("Brought the Android window to the front")
+            } else {
+                appendLog("Launched \(packageName) but could not activate the Android window automatically")
+            }
+        }
+
+        if prefersSeparateWindow && openedSeparateWindow {
+            appendLog("Opened \(launchTitle) in its own window")
+        }
+
         appendLog("Launched \(packageName)")
     }
 
@@ -1041,6 +1424,7 @@ final class AppModel: ObservableObject {
     /// queryable. Retry launch a few times so automatic post-install opens are reliable.
     private func launchPackageAfterInstall(
         named packageName: String,
+        displayName: String? = nil,
         using toolchain: AndroidToolchain,
         serial: String
     ) async throws {
@@ -1048,14 +1432,19 @@ final class AppModel: ObservableObject {
 
         for attempt in 1...maxAttempts {
             do {
-                try await launchPackage(named: packageName, using: toolchain, serial: serial)
+                try await launchPackage(
+                    named: packageName,
+                    displayName: displayName,
+                    using: toolchain,
+                    serial: serial
+                )
                 return
             } catch {
                 guard attempt < maxAttempts else {
                     throw error
                 }
 
-                appendLog("Retrying launch for \(packageName) after install (\(attempt + 1)/\(maxAttempts))")
+                appendLog("Retrying launch for \(displayName ?? packageName) after install (\(attempt + 1)/\(maxAttempts))")
                 try await Task.sleep(for: .seconds(2))
             }
         }
@@ -1109,7 +1498,8 @@ final class AppModel: ObservableObject {
                 "--brief",
                 packageName,
             ],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 15
         )
 
         guard output.status == 0 else {
@@ -1141,7 +1531,8 @@ final class AppModel: ObservableObject {
                 "-c", "android.intent.category.LAUNCHER",
                 packageName,
             ],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 15
         )
 
         guard output.status == 0 else {
@@ -1183,7 +1574,8 @@ final class AppModel: ObservableObject {
         let uninstall = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["-s", serial, "uninstall", packageName],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 30
         )
 
         guard uninstall.status == 0, uninstall.stdout.localizedCaseInsensitiveContains("success") else {
@@ -1265,7 +1657,8 @@ final class AppModel: ObservableObject {
         let output = try await Shell.run(
             executable: toolchain.adb.path,
             arguments: ["-s", serial, "shell", "pm", "list", "packages"],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 20
         )
 
         guard output.status == 0 else {
@@ -1315,6 +1708,13 @@ final class AppModel: ObservableObject {
             return
         }
 
+        guard isValidAndroidPackageName(packageName) else {
+            let error = RuntimeError.invalidPackageName(packageName)
+            statusMessage = error.localizedDescription
+            appendLog("Rejected launcher request with invalid package name: \(packageName)")
+            return
+        }
+
         let displayName = components.queryItems?.first(where: { $0.name == "name" })?.value
         pendingLaunchRequest = LaunchRequest(packageName: packageName, displayName: displayName)
         appendLog("Received launcher request for \(displayName ?? packageName)")
@@ -1361,8 +1761,16 @@ final class AppModel: ObservableObject {
                 try await refreshInstalledPackages(using: toolchain, serial: serial)
             }
 
-            try await launchPackage(named: request.packageName, using: toolchain, serial: serial)
-            statusMessage = "Launched \(request.displayName ?? request.packageName)"
+            try await launchPackage(
+                named: request.packageName,
+                displayName: request.displayName,
+                using: toolchain,
+                serial: serial
+            )
+            statusMessage = statusMessageForLaunch(
+                of: request.displayName,
+                packageName: request.packageName
+            )
             pendingLaunchRequest = nil
         } catch {
             statusMessage = error.localizedDescription
@@ -1427,7 +1835,8 @@ final class AppModel: ObservableObject {
         let output = try await Shell.run(
             executable: aapt.path,
             arguments: ["dump", "badging", apkURL.path],
-            environment: toolchain.environment
+            environment: toolchain.environment,
+            timeout: 20
         )
 
         return output.status == 0 ? output.stdout : nil
@@ -1478,6 +1887,10 @@ final class AppModel: ObservableObject {
     // MARK: - Filesystem helpers and logging
 
     private func writeLauncher(for request: LaunchRequest) throws {
+        guard isValidAndroidPackageName(request.packageName) else {
+            throw RuntimeError.invalidPackageName(request.packageName)
+        }
+
         ensureLauncherFolderExists()
 
         var components = URLComponents()
@@ -1499,10 +1912,186 @@ final class AppModel: ObservableObject {
     }
 
     private func safeFileName(for value: String) -> String {
-        let invalid = CharacterSet(charactersIn: "/:\\")
-        let parts = value.components(separatedBy: invalid).filter { !$0.isEmpty }
+        let disallowed = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: " .-_()"))
+            .inverted
+        let parts = value.components(separatedBy: disallowed).filter { !$0.isEmpty }
         let sanitized = parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        return sanitized.isEmpty ? "Android App" : sanitized
+        let trimmed = String(sanitized.prefix(80))
+        return trimmed.isEmpty ? "Android App" : trimmed
+    }
+
+    /// Package names travel through custom URL launches and `adb` commands, so keep them within
+    /// the Android identifier grammar even though subprocesses are already launched without a
+    /// shell.
+    private func isValidAndroidPackageName(_ value: String) -> Bool {
+        let pattern = #"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$"#
+        return value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private func statusMessageForLaunch(of displayName: String?, packageName: String) -> String {
+        let title = displayName ?? packageName
+
+        if settings.preferSeparateAppWindows, scrcpyExecutableURL() != nil {
+            return "Opened \(title) in its own window"
+        }
+
+        if settings.showAndroidWindow {
+            return "Opened \(title) in the Android window"
+        }
+
+        return "Launched \(title) in the hidden Android runtime"
+    }
+
+    /// scrcpy is optional today so packaged builds can adopt it incrementally. Search the bundle
+    /// first for future self-contained releases, then fall back to common user installs.
+    private func scrcpyExecutableURL() -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        var candidates: [URL] = []
+
+        if let override = environment["MACOSDROID_SCRCPY_PATH"], !override.isEmpty {
+            candidates.append(URL(fileURLWithPath: NSString(string: override).expandingTildeInPath))
+        }
+
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/scrcpy") {
+            candidates.append(bundled)
+        }
+
+        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/scrcpy"))
+        candidates.append(URL(fileURLWithPath: "/usr/local/bin/scrcpy"))
+
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    private func launchScrcpyWindow(for device: ADBDevice) throws {
+        guard let scrcpy = scrcpyExecutableURL() else {
+            throw RuntimeError.launchFailed(
+                settings.showAndroidWindow
+                    ? "scrcpy is not installed, so macOSdroid fell back to the Android runtime display."
+                    : "scrcpy is not installed. Install scrcpy or enable Show Android Window."
+            )
+        }
+
+        let arguments = [
+            "-s", device.serial,
+            "--window-title", safeFileName(for: device.title),
+        ]
+
+        _ = try Shell.spawn(executable: scrcpy.path, arguments: arguments)
+        appendLog("Opened \(device.title) via scrcpy")
+    }
+
+    /// Prefer the packaged setup script so drag-installed builds remain self-service, then fall
+    /// back to the repository script for source checkouts.
+    private func runtimeProvisionerScriptURL() -> URL? {
+        let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("scripts", isDirectory: true)
+            .appendingPathComponent("provision-runtime.sh", isDirectory: false)
+
+        let repositoryScript = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("scripts", isDirectory: true)
+            .appendingPathComponent("provision-runtime.sh", isDirectory: false)
+
+        let candidates = [bundled, repositoryScript].compactMap { $0 }
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    /// Runtime setup can be long-running and verbose, so send the full transcript to a dedicated
+    /// log file instead of spamming the main activity stream.
+    private func runLoggedProcess(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        logFile: URL
+    ) async throws -> Int32 {
+        ensureManagedSupportFoldersExist()
+        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+
+        guard let logHandle = try? FileHandle(forWritingTo: logFile) else {
+            throw RuntimeError.runtimeProvisioningFailed("Unable to open \(logFile.lastPathComponent).")
+        }
+
+        _ = try? logHandle.seekToEnd()
+
+        let header = """
+        === \(Date().formatted(date: .abbreviated, time: .standard)) ===
+        Command: \(([executable] + arguments).joined(separator: " "))
+
+        """
+
+        try? logHandle.write(contentsOf: Data(header.utf8))
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+
+            var mergedEnvironment = ProcessInfo.processInfo.environment
+            for (key, value) in environment {
+                mergedEnvironment[key] = value
+            }
+            process.environment = mergedEnvironment
+
+            process.terminationHandler = { process in
+                let footer = "\nExit status: \(process.terminationStatus)\n"
+                try? logHandle.write(contentsOf: Data(footer.utf8))
+                try? logHandle.close()
+                continuation.resume(returning: process.terminationStatus)
+            }
+
+            do {
+                try process.run()
+            } catch {
+                try? logHandle.close()
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func migrateManagedFoldersIfNeeded() {
+        migrateFolderContentsIfNeeded(
+            from: AppSettings.legacyDefaultWatchFolder,
+            to: AppSettings.defaultWatchFolder,
+            isManagedDestination: settings.watchFolderPath == AppSettings.defaultWatchFolder.path
+        )
+        migrateFolderContentsIfNeeded(
+            from: AppSettings.legacyDefaultLauncherFolder,
+            to: AppSettings.defaultLauncherFolder,
+            isManagedDestination: true
+        )
+    }
+
+    private func migrateFolderContentsIfNeeded(from legacyFolder: URL, to managedFolder: URL, isManagedDestination: Bool) {
+        guard isManagedDestination, legacyFolder.standardizedFileURL != managedFolder.standardizedFileURL else {
+            return
+        }
+
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: legacyFolder.path) else {
+            return
+        }
+
+        let legacyContents = (try? fileManager.contentsOfDirectory(at: legacyFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        guard !legacyContents.isEmpty else {
+            return
+        }
+
+        do {
+            try fileManager.createDirectory(at: managedFolder, withIntermediateDirectories: true)
+
+            for sourceURL in legacyContents {
+                let destinationURL = managedFolder.appendingPathComponent(sourceURL.lastPathComponent)
+                guard !fileManager.fileExists(atPath: destinationURL.path) else {
+                    continue
+                }
+                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            }
+        } catch {
+            appendLog("Managed folder migration failed: \(error.localizedDescription)")
+        }
     }
 
     private func ensureWatchFolderExists() {
@@ -1512,6 +2101,26 @@ final class AppModel: ObservableObject {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
             appendLog("Unable to create watch folder: \(error.localizedDescription)")
+        }
+    }
+
+    /// Keep all generated runtime state inside the app-owned support tree so drag-installed builds
+    /// do not depend on legacy folders like `~/Applications` or `~/.android`.
+    private func ensureManagedSupportFoldersExist() {
+        let folders = [
+            AppSettings.applicationSupportDirectory,
+            AppSettings.defaultManagedSDKRoot.deletingLastPathComponent(),
+            AppSettings.logsDirectory,
+            AppSettings.managedAndroidUserHome,
+            AppSettings.managedAVDDirectory,
+        ]
+
+        for folder in folders {
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                appendLog("Unable to prepare \(folder.lastPathComponent): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1527,11 +2136,58 @@ final class AppModel: ObservableObject {
         settings.save()
     }
 
+    private func normalizedFilesystemPath(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ""
+        }
+
+        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL.path
+    }
+
+    @discardableResult
+    private func focusAndroidWindow() -> Bool {
+        guard settings.showAndroidWindow, let emulatorProcess else {
+            return false
+        }
+
+        guard let runtimeApp = NSRunningApplication(processIdentifier: emulatorProcess.processIdentifier) else {
+            return false
+        }
+
+        return runtimeApp.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+    }
+
     private func appendLog(_ message: String) {
-        logs.insert(LogEntry(timestamp: Date(), message: message), at: 0)
+        let entry = LogEntry(timestamp: Date(), message: message)
+        logs.insert(entry, at: 0)
+        appendLogToDisk(entry)
 
         if logs.count > 150 {
             logs.removeLast(logs.count - 150)
+        }
+    }
+
+    private func appendLogToDisk(_ entry: LogEntry) {
+        ensureManagedSupportFoldersExist()
+        let line = "\(entry.timestamp.formatted(date: .abbreviated, time: .standard))  \(entry.message)\n"
+        let data = Data(line.utf8)
+
+        if !FileManager.default.fileExists(atPath: AppSettings.activityLogFile.path) {
+            try? data.write(to: AppSettings.activityLogFile, options: .atomic)
+            return
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: AppSettings.activityLogFile) else {
+            return
+        }
+
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            try? handle.close()
         }
     }
 }

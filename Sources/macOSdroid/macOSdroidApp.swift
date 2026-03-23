@@ -16,6 +16,14 @@ struct macOSdroidApp: App {
         }
         .defaultSize(width: 940, height: 760)
 
+        Window("Activity Log", id: "activity-log") {
+            LogWindowView(model: model)
+                .onOpenURL { url in
+                    model.handleIncomingURL(url)
+                }
+        }
+        .defaultSize(width: 860, height: 520)
+
         MenuBarExtra("macOSdroid", systemImage: "square.stack.3d.up.fill") {
             MenuBarView(model: model)
                 .onOpenURL { url in
