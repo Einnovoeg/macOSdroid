@@ -24,6 +24,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Reduced repeated removable-volume access prompts by preferring managed SDK and AVD paths inside Application Support over legacy external or user-visible locations.
 - Improved Homebrew detection so managed runtime setup works on both Apple Silicon and Intel Homebrew prefixes.
 - Added bounded subprocess handling and setup logging around long-running tool invocations so runtime setup and health checks fail more transparently.
+- Expanded early-boot APK install retry handling to cover transient Android package-manager null-pointer failures during cold starts.
 
 ### Compliance
 

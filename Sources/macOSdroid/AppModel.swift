@@ -1093,6 +1093,8 @@ final class AppModel: ObservableObject {
         let normalized = message.localizedLowercase
         return normalized.contains("settings' before system providers are installed")
             || normalized.contains("before system providers are installed")
+            || normalized.contains("packagemanagerinternal.freestorage")
+            || (normalized.contains("nullpointerexception") && normalized.contains("executing 'install'"))
     }
 
     /// Package-name inference prefers `apkanalyzer`, but `aapt` remains a reliable fallback when
