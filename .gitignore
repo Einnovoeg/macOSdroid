@@ -32,3 +32,7 @@ tmp/
 .env
 .env.*
 .netrc
+
+# Agent and Session logs
+AGENTS.md
+session*.md

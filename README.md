@@ -133,5 +133,18 @@ This repository contains original project code only. It does not ship third-part
 The project itself is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## Support
-
+ 
 - Buy Me a Coffee: [buymeacoffee.com/einnovoeg](https://buymeacoffee.com/einnovoeg)
+
+## Known Limitations and Future Work
+
+`macOSdroid` is a work in progress. The following areas are known limitations or targets for future development:
+
+- **Real Device Verification**: While ADB device mirroring is implemented, comprehensive verification with a wider range of real Android hardware is ongoing.
+- **Bundled scrcpy**: Currently, `scrcpy` is an external dependency. We are evaluating whether to bundle it within the app resources for a completely offline installation experience.
+- **Window Profiles**: Adding per-app window sizing and profile presets for `scrcpy` sessions to allow apps to open in their native aspect ratios.
+- **GUI Polish**: Ongoing refinements to iconography, layout spacing, and copy for a more native macOS feel.
+
+### Contribute!
+If you encounter any bugs, have feature requests, or can help optimize the Android runtime orchestration, please open an issue or submit a pull request. Your help in making `macOSdroid` a robust tool for Android app management on macOS is greatly appreciated!
+
